@@ -56,8 +56,11 @@ void launch_moe_expert_ffn(
 // [num_experts, ffn, hidden], down_q is Q6_K [num_experts, hidden, ffn] (GGUF
 // native layout). h_scratch: [num_tokens*top_k*ffn] fp32; out_scratch:
 // [num_tokens*hidden] fp32. output: [num_tokens, hidden] bf16. hidden,ffn % 256 == 0.
+// gate_type/up_type/down_type are ggml type ids (12=Q4_K, 14=Q6_K); Q4_K_M mixes
+// them per tensor, so each is dispatched independently inside the kernel.
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
+    int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn,

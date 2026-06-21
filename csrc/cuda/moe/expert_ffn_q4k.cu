@@ -1,16 +1,17 @@
 // Fused quantized MoE expert FFN for decode (batch small).
 //
-// The optimization that closes most of the gap vs llama.cpp on Qwen3-MoE decode:
-//   - dequantizes ONLY the top_k routed experts (not all 128), on-read inside the
-//     GEMV — no bf16 materialization, no 16x wasted dequant.
-//   - parallelizes across (expert-slot x output-row): one warp per output row, so
-//     thousands of warps fill the GPU instead of one CTA per token.
+// Closes most of the gap vs llama.cpp on Qwen3-MoE decode:
+//   - dequantizes ONLY the top_k routed experts, on-read inside the GEMV — no
+//     bf16 materialization, no 16x wasted dequant of unused experts.
+//   - one warp per output row; thousands of warps fill the GPU (vs one CTA).
 //   - reads GGUF-native quantized weights directly (gate/up = Q4_K [E,F,H],
-//     down = Q6_K [E,H,F]); for batch-1 decode this is memory-bound on the
-//     quantized weight reads, which is the right regime for a CUDA-core GEMV.
+//     down = Q6_K [E,H,F]). Decode is memory-bound on the quantized weight reads
+//     — the right regime for a CUDA-core GEMV.
+//   - down pass accumulates the top_k experts inside each warp and writes the
+//     output once (no atomics, no scratch).
 //
-// Q4_K/Q6_K block decoders are the byte-exact ones validated in dequant_gguf.cu.
-// Requires H and F to be multiples of 256 (Qwen3-30B-A3B: H=2048, F=768).
+// Q4_K/Q6_K decoders are the byte-exact ones validated in dequant_gguf.cu.
+// Requires hidden and ffn to be multiples of 256 (Qwen3-30B-A3B: 2048, 768).
 //
 // Portable CUDA — sm_89 .. sm_120/sm_121.
 
@@ -38,7 +39,6 @@ __device__ __forceinline__ void q4kf_scale_min(int j, const unsigned char* q, in
     else { *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
            *m = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4); }
 }
-// warp-cooperative dequant of one Q4_K 256-block -> s[256] (lane writes 8 values)
 __device__ __forceinline__ void warp_deq_q4k(const unsigned char* blk, float* s, int lane) {
     float d = q4kf_h2f(blk), dmin = q4kf_h2f(blk + 2);
     const unsigned char* sc = blk + 4; const unsigned char* qs = blk + 16;
@@ -52,7 +52,6 @@ __device__ __forceinline__ void warp_deq_q4k(const unsigned char* blk, float* s,
         s[g*64 + 32 + lane] = d2 * (q[lane] >> 4)  - mm2;
     }
 }
-// warp-cooperative dequant of one Q6_K 256-block -> s[256]
 __device__ __forceinline__ void warp_deq_q6k(const unsigned char* blk, float* s, int lane) {
     const unsigned char* ql = blk; const unsigned char* qh = blk + 128;
     const signed char* sc = (const signed char*)(blk + 192); float d = q4kf_h2f(blk + 208);
@@ -72,16 +71,24 @@ __device__ __forceinline__ void warp_deq_q6k(const unsigned char* blk, float* s,
 }
 __device__ __forceinline__ float q4kf_silu(float x) { return x / (1.f + __expf(-x)); }
 
+// ggml types: Q4_K=12 (144 B/256), Q6_K=14 (210 B/256). Q4_K_M mixes them per tensor.
+__device__ __forceinline__ int q_block_bytes(int t) { return t == 14 ? 210 : 144; }
+__device__ __forceinline__ void warp_deq(int t, const unsigned char* blk, float* s, int lane) {
+    if (t == 14) warp_deq_q6k(blk, s, lane);
+    else         warp_deq_q4k(blk, s, lane);
+}
+
 // gate_up: h[ts,f] = SiLU(<x, gate[e,f]>) * <x, up[e,f]>.  one warp per f.
-// grid=(num_tokens*top_k, F/WPB), block=WPB*32. smem: s_x[H] + WPB*256.
+// grid=(num_tokens*top_k, ffn/WPB), block=WPB*32. smem: s_x[hidden] + WPB*256.
 __global__ void gate_up_q4k_kernel(
     const __nv_bfloat16* __restrict__ input, const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
-    float* __restrict__ h_scratch, int H, int F, int top_k
+    float* __restrict__ h_scratch, int H, int F, int top_k, int gate_type, int up_type
 ) {
-    extern __shared__ float smem[];
+    extern __shared__ float smem[];          // s_x[H]
     float* s_x = smem;
-    float* s_deq = smem + H + (threadIdx.x / 32) * 256;
+    __shared__ float s_deq_all[WPB][256];
+    float* s_deq = s_deq_all[threadIdx.x / 32];
     const int ts = blockIdx.x, tok = ts / top_k;
     const int e = expert_ids[ts];
     for (int i = threadIdx.x; i < H; i += blockDim.x) s_x[i] = __bfloat162float(input[(size_t)tok * H + i]);
@@ -91,16 +98,17 @@ __global__ void gate_up_q4k_kernel(
     const int f = blockIdx.y * WPB + (threadIdx.x / 32);
     if (f >= F) return;
     const int nblk = H / 256;
-    const unsigned char* gbase = gate_q + ((size_t)e * F + f) * nblk * 144;
-    const unsigned char* ubase = up_q   + ((size_t)e * F + f) * nblk * 144;
+    const int gbb = q_block_bytes(gate_type), ubb = q_block_bytes(up_type);
+    const unsigned char* gbase = gate_q + ((size_t)e * F + f) * nblk * gbb;
+    const unsigned char* ubase = up_q   + ((size_t)e * F + f) * nblk * ubb;
     float g = 0.f, u = 0.f;
     for (int blk = 0; blk < nblk; blk++) {
-        warp_deq_q4k(gbase + (size_t)blk * 144, s_deq, lane); __syncwarp();
+        warp_deq(gate_type, gbase + (size_t)blk * gbb, s_deq, lane); __syncwarp();
         float p = 0.f;
         #pragma unroll
         for (int e8 = 0; e8 < 8; e8++) p += s_deq[lane + e8*32] * s_x[blk*256 + lane + e8*32];
         g += q4kf_wsum(p); __syncwarp();
-        warp_deq_q4k(ubase + (size_t)blk * 144, s_deq, lane); __syncwarp();
+        warp_deq(up_type, ubase + (size_t)blk * ubb, s_deq, lane); __syncwarp();
         p = 0.f;
         #pragma unroll
         for (int e8 = 0; e8 < 8; e8++) p += s_deq[lane + e8*32] * s_x[blk*256 + lane + e8*32];
@@ -109,41 +117,41 @@ __global__ void gate_up_q4k_kernel(
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(g) * u;
 }
 
-// down: out[tok,h] += weight * <h[ts], down[e,h]>.  one warp per h. atomicAdd over slots.
-// grid=(num_tokens*top_k, H/WPB), block=WPB*32. smem: s_h[F] + WPB*256.
+// down: out[tok,hh] = sum_j weight_j * <h[tok,j], down[e_j, hh]>.
+// one warp per (token, hh); loops over top_k experts internally and writes once.
+// grid=(num_tokens, hidden/WPB), block=WPB*32. smem: WPB*256 (s_deq per warp).
 __global__ void down_q6k_kernel(
     const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
     const float* __restrict__ expert_weights, const float* __restrict__ h_scratch,
-    float* __restrict__ out_scratch, int H, int F, int top_k
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int down_type
 ) {
-    extern __shared__ float smem[];
-    float* s_h = smem;
-    float* s_deq = smem + F + (threadIdx.x / 32) * 256;
-    const int ts = blockIdx.x, tok = ts / top_k;
-    const int e = expert_ids[ts];
-    const float w = expert_weights[ts];
-    for (int i = threadIdx.x; i < F; i += blockDim.x) s_h[i] = h_scratch[(size_t)ts * F + i];
-    __syncthreads();
-
+    __shared__ float s_deq_all[WPB][256];
+    float* s_deq = s_deq_all[threadIdx.x / 32];
+    const int token = blockIdx.x;
     const int lane = threadIdx.x % 32;
     const int hh = blockIdx.y * WPB + (threadIdx.x / 32);
     if (hh >= H) return;
     const int nblk = F / 256;
-    const unsigned char* dbase = down_q + ((size_t)e * H + hh) * nblk * 210;
-    float y = 0.f;
-    for (int blk = 0; blk < nblk; blk++) {
-        warp_deq_q6k(dbase + (size_t)blk * 210, s_deq, lane); __syncwarp();
-        float p = 0.f;
-        #pragma unroll
-        for (int e8 = 0; e8 < 8; e8++) p += s_deq[lane + e8*32] * s_h[blk*256 + lane + e8*32];
-        y += q4kf_wsum(p); __syncwarp();
-    }
-    if (lane == 0) atomicAdd(&out_scratch[(size_t)tok * H + hh], w * y);
-}
+    const int dbb = q_block_bytes(down_type);
 
-__global__ void f32_to_bf16_kernel(const float* __restrict__ in, __nv_bfloat16* __restrict__ out, long n) {
-    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2bfloat16(in[i]);
+    float acc = 0.f;
+    for (int j = 0; j < top_k; j++) {
+        const int ts = token * top_k + j;
+        const int e = expert_ids[ts];
+        const float w = expert_weights[ts];
+        const unsigned char* dbase = down_q + ((size_t)e * H + hh) * nblk * dbb;
+        float y = 0.f;
+        for (int blk = 0; blk < nblk; blk++) {
+            warp_deq(down_type, dbase + (size_t)blk * dbb, s_deq, lane); __syncwarp();
+            float p = 0.f;
+            #pragma unroll
+            for (int e8 = 0; e8 < 8; e8++)
+                p += s_deq[lane + e8*32] * h_scratch[(size_t)ts * F + blk*256 + lane + e8*32];
+            y += q4kf_wsum(p); __syncwarp();
+        }
+        acc += w * y;
+    }
+    if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
@@ -151,28 +159,25 @@ __global__ void f32_to_bf16_kernel(const float* __restrict__ in, __nv_bfloat16* 
 
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
+    int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn, cudaStream_t stream
 ) {
-    cudaMemsetAsync(out_scratch, 0, (size_t)num_tokens * hidden * sizeof(float), stream);
+    (void)out_scratch;
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
-    size_t gu_smem = ((size_t)hidden + WPB * 256) * sizeof(float);
+    size_t gu_smem = (size_t)hidden * sizeof(float);   // s_x only; s_deq is static
     gate_up_q4k_kernel<<<gu, WPB * 32, gu_smem, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(input),
         reinterpret_cast<const unsigned char*>(gate_q),
         reinterpret_cast<const unsigned char*>(up_q),
-        expert_ids, h_scratch, hidden, ffn, top_k);
+        expert_ids, h_scratch, hidden, ffn, top_k, gate_type, up_type);
 
-    dim3 dn(num_tokens * top_k, (hidden + WPB - 1) / WPB);
-    size_t dn_smem = ((size_t)ffn + WPB * 256) * sizeof(float);
-    down_q6k_kernel<<<dn, WPB * 32, dn_smem, stream>>>(
+    dim3 dn(num_tokens, (hidden + WPB - 1) / WPB);
+    down_q6k_kernel<<<dn, WPB * 32, 0, stream>>>(
         reinterpret_cast<const unsigned char*>(down_q),
-        expert_ids, expert_weights, h_scratch, out_scratch, hidden, ffn, top_k);
-
-    long n = (long)num_tokens * hidden;
-    f32_to_bf16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
-        out_scratch, reinterpret_cast<__nv_bfloat16*>(output), n);
+        expert_ids, expert_weights, h_scratch,
+        reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, down_type);
 }
 #endif
 
